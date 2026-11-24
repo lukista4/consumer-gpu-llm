@@ -1,0 +1,124 @@
+Patch 3/4: finetune-lora: optional per-micro-batch ledger
+ (LORA_LEDGER_PATH)
+
+Writes one TSV line per evaluated micro-batch (train and val): position, updates done, lr, item loss, correct/masked token counts. Adds ggml_opt_result_counts(). Nothing is written when the variable is unset.
+---
+ examples/training/finetune-lora.cpp | 60 ++++++++++++++++++++++++++++-
+ ggml/include/ggml-opt.h             |  1 +
+ ggml/src/ggml-opt.cpp               |  6 +++
+ 3 files changed, 66 insertions(+), 1 deletion(-)
+
+diff --git a/examples/training/finetune-lora.cpp b/examples/training/finetune-lora.cpp
+index 77ef0b5..5c69223 100644
+--- a/examples/training/finetune-lora.cpp
++++ b/examples/training/finetune-lora.cpp
+@@ -442,6 +442,63 @@ struct checkpoint_callback_data {
+     std::string dataset_path;
+ };
+ 
++// one line per evaluated micro-batch (training and validation) in the file named by the
++// environment variable LORA_LEDGER_PATH; nothing is written when it is unset. Item values are differences of the
++// running counts of the result; the item loss is read from the loss tensor of the step just evaluated.
++static bool lora_ledger_enabled() {
++    const char * path = std::getenv("LORA_LEDGER_PATH");
++    return path != nullptr && path[0] != '\0';
++}
++
++static void lora_ledger_line(bool train, ggml_opt_context_t opt_ctx, ggml_opt_result_t result,
++                            int64_t ibatch, int64_t ibatch_max) {
++    static FILE * f     = nullptr;
++    static bool   tried = false;
++    static int64_t prev_ndata[2]   = {0, 0};
++    static int64_t prev_correct[2] = {0, 0};
++    static int64_t prev_masked[2]  = {0, 0};
++    if (!tried) {
++        tried = true;
++        if (lora_ledger_enabled()) {
++            f = std::fopen(std::getenv("LORA_LEDGER_PATH"), "ab");
++            if (!f) {
++                LOG_ERR("ledger: cannot open the ledger file\n");
++                std::exit(1);
++            }
++            std::fseek(f, 0, SEEK_END);
++            if (std::ftell(f) == 0) {
++                fprintf(f, "kind\tepoch\tpos\tpos_max\tupdates_done\tlr\titem_loss\titem_correct\titem_masked"
++                           "\trun_loss\trun_ndata\n");
++            }
++        }
++    }
++    if (!f) return;
++
++    const int k = train ? 0 : 1;
++    int64_t ndata = 0, ncorrect = 0, nmasked = 0;
++    ggml_opt_result_ndata(result, &ndata);
++    ggml_opt_result_counts(result, &ncorrect, &nmasked);
++    if (ndata <= prev_ndata[k]) {  // the result was reset (new epoch)
++        prev_ndata[k] = 0; prev_correct[k] = 0; prev_masked[k] = 0;
++    }
++    double run_loss = 0.0;
++    ggml_opt_result_loss(result, &run_loss, nullptr);
++    float item_loss = NAN;
++    struct ggml_tensor * tl = ggml_opt_loss(opt_ctx);
++    if (tl && tl->type == GGML_TYPE_F32 && ggml_nbytes(tl) == sizeof(float)) {
++        ggml_backend_tensor_get(tl, &item_loss, 0, sizeof(float));
++    }
++    const checkpoint_callback_data * cb = g_checkpoint_data;
++    const long long updates = (cb && cb->lr_scheduler) ? (long long) cb->lr_scheduler->current_step : -1;
++    const double    lr      = (cb && cb->lr_scheduler) ? (double) cb->lr_scheduler->last_lr : NAN;
++    fprintf(f, "%s\t%d\t%lld\t%lld\t%lld\t%.9g\t%.9g\t%lld\t%lld\t%.9g\t%lld\n",
++            train ? "train" : "val", cb ? (int) cb->current_epoch : -1, (long long) ibatch, (long long) ibatch_max,
++            updates, lr, (double) item_loss, (long long) (ncorrect - prev_correct[k]),
++            (long long) (nmasked - prev_masked[k]), run_loss, (long long) ndata);
++    std::fflush(f);
++    prev_ndata[k] = ndata; prev_correct[k] = ncorrect; prev_masked[k] = nmasked;
++}
++
+ static void checkpoint_progress_callback(
+         bool               train,
+         ggml_opt_context_t opt_ctx,
+@@ -451,6 +508,7 @@ static void checkpoint_progress_callback(
+         int64_t            ibatch_max,
+         int64_t            t_start_us) {
+     ggml_opt_epoch_callback_progress_bar(train, opt_ctx, dataset, result, ibatch, ibatch_max, t_start_us);
++    lora_ledger_line(train, opt_ctx, result, ibatch, ibatch_max);  // per-item ledger (patch 0003)
+ 
+     if (!train) return;
+ 
+@@ -971,7 +1029,7 @@ int main(int argc, char ** argv) {
+             resume_batch = (start_step % training_batches_per_epoch) - 1;
+         }
+ 
+-        ggml_opt_epoch_callback epoch_callback = (ft_params.checkpoint_save_steps <= 0) ?
++        ggml_opt_epoch_callback epoch_callback = (ft_params.checkpoint_save_steps <= 0 && !lora_ledger_enabled()) ?
+             ggml_opt_epoch_callback_progress_bar : checkpoint_progress_callback;
+ 
+         if (resume_batch >= 0) {
+diff --git a/ggml/include/ggml-opt.h b/ggml/include/ggml-opt.h
+index 710fb40..289b157 100644
+--- a/ggml/include/ggml-opt.h
++++ b/ggml/include/ggml-opt.h
+@@ -205,6 +205,7 @@ extern "C" {
+ 
+     // get data from result, uncertainties are optional and can be ignored by passing NULL
+     GGML_API void ggml_opt_result_ndata(   ggml_opt_result_t result, int64_t * ndata);                  // writes 1 value, number of datapoints
++    GGML_API void ggml_opt_result_counts(  ggml_opt_result_t result, int64_t * ncorrect, int64_t * nmasked);  // writes 2 values, running counts
+     GGML_API void ggml_opt_result_loss(    ggml_opt_result_t result, double  * loss,     double * unc); // writes 1 value
+     GGML_API void ggml_opt_result_pred(    ggml_opt_result_t result, int32_t * pred);                   // writes ndata values
+     GGML_API void ggml_opt_result_accuracy(ggml_opt_result_t result, double  * accuracy, double * unc); // writes 1 value
+diff --git a/ggml/src/ggml-opt.cpp b/ggml/src/ggml-opt.cpp
+index a976700..ca0c949 100644
+--- a/ggml/src/ggml-opt.cpp
++++ b/ggml/src/ggml-opt.cpp
+@@ -840,6 +840,12 @@ void ggml_opt_result_ndata(ggml_opt_result_t result, int64_t * ndata) {
+     *ndata = result->ndata;
+ }
+ 
++// running counts behind ggml_opt_result_accuracy.
++void ggml_opt_result_counts(ggml_opt_result_t result, int64_t * ncorrect, int64_t * nmasked) {
++    *ncorrect = result->ncorrect;
++    *nmasked  = result->nmasked;
++}
++
+ void ggml_opt_result_loss(ggml_opt_result_t result, double * loss, double * unc) {
+     const int64_t nbatches = result->loss.size(); // Number of physical batches.
+ 

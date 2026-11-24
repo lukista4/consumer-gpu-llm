@@ -1,0 +1,135 @@
+[
+  {
+    "id": "L1.1",
+    "problem": "Throughput of think-on calls on an 8 GB RX 7600",
+    "lever": "Slot layout 8 x 8,192 instead of 3 x 8,192 on the stock server build",
+    "rationale": "The batched matmul path covers up to about 8 columns cheaply; per-step cost roughly flat from 6 to 8 slots, higher at 10-12 (DERIVED from earlier step timings).",
+    "predicted": "+25-40% aggregate decode vs 3-6 slots",
+    "observed": "79.0 -> 101.4 tok/s live decode (+28%); VRAM peak 5.89 -> 6.89 GB",
+    "label": "MEASURED",
+    "regime": {
+      "model_file": "Qwen3.5-9B Q4_K_M (public imatrix)",
+      "runtime": "llama-server, stock build of the fork, Vulkan",
+      "slots_x_ctx": "3 x 8,192 vs 8 x 8,192",
+      "kv_type": "q8_0 K and V, flash attention on",
+      "call_shape": "think-on calls, prompt median 1,884 tokens, think cap 4,096; 540 s window per arm; decode rate from /slots n_decoded"
+    },
+    "gate": "same build and file; adopt at >= +10% live decode",
+    "status": "DEPLOYED",
+    "attempts": [
+      {
+        "observed": "10 x 8,192 with a custom kernel build: 75.9 tok/s (slower than 8 slots)",
+        "regime": "same file and calls; custom build with small-N Q4_0 kernel env set"
+      }
+    ]
+  },
+  {
+    "id": "L1.2",
+    "problem": "Throughput of think-on calls on an 8 GB RX 7600",
+    "lever": "Block verifier + back-off n-gram drafter (speculative decoding without a draft model)",
+    "rationale": "Fill the per-step floor beyond 8 rows with drafted tokens.",
+    "predicted": "+20-60% at 12 slots (a guess)",
+    "observed": "8 x 8,192 live: 74.1 vs 101.4 tok/s (-27%), 433 vs 342 s per call. Offline replay: 1.75-1.77 emitted tokens per verify step at draft length 4.",
+    "label": "MEASURED",
+    "regime": {
+      "model_file": "Qwen3.5-9B Q4_K_M (public imatrix)",
+      "runtime": "llama-server, custom drafter build, Vulkan",
+      "slots_x_ctx": "8 x 8,192",
+      "kv_type": "q8_0 K and V, flash attention on",
+      "call_shape": "think-on calls as in L1.1"
+    },
+    "gate": "adopt at >= +15% live decode with unchanged downstream quality",
+    "status": "RETIRED",
+    "status_reason": "The batch already saturates the GPU; drafting adds verify cost without freeing compute.",
+    "attempts": [
+      {
+        "observed": "Earlier: 333-363 vs 191 tok/s at 16 x 1,664 on short thinking-off calls; outputs never quality-checked",
+        "regime": "Q4_0 file, short calls; does not match the deployed regime"
+      }
+    ]
+  },
+  {
+    "id": "L1.3",
+    "problem": "Throughput of think-on calls on an 8 GB RX 7600",
+    "lever": "Small-N Q4_0 Vulkan matmul kernel + in-place recurrent state",
+    "rationale": "Faster small-batch Q4_0 matmul and no state copies.",
+    "predicted": "up to 2.9x on a Q4_0-format file",
+    "observed": "On the Q4_K_M file at 8 x 8,192: 104.9 vs 101.4 tok/s (+3%, a tie). The file has 0 Q4_0 tensors (Q4_K 125, Q6_K 49, Q5_K 16, Q8_0 20, F32 232) and the kernel routes Q4_0 x F32 only, so it cannot fire.",
+    "label": "MEASURED",
+    "regime": {
+      "model_file": "Qwen3.5-9B Q4_K_M (public imatrix)",
+      "runtime": "llama-server, custom kernel build, Vulkan",
+      "slots_x_ctx": "8 x 8,192",
+      "kv_type": "q8_0 K and V, flash attention on",
+      "call_shape": "think-on calls as in L1.1"
+    },
+    "gate": "needs a Q4_0-format file that passes the KL screen (mean KLD <= about 0.005)",
+    "status": "RETIRED",
+    "status_reason": "No Q4_0-format file passed the KL screen (best 0.0072 vs 0.0042 for Q4_K_M); no kernel port to K-quants.",
+    "attempts": [
+      {
+        "observed": "On a Q4_0 file: 289 tok/s at 16 x 4,096; 118 at 8 x 8,192; 430-431 at 32 x 768/1,536",
+        "regime": "Q4_0 file, thinking-off calls with long outputs"
+      }
+    ]
+  },
+  {
+    "id": "L1.4",
+    "problem": "Throughput at very wide batches",
+    "lever": "WMMA (cooperative matrix) Q4_0 path for wide batches",
+    "rationale": "Use RDNA3 WMMA when many rows are decoded per step.",
+    "predicted": "large gains at 32 slots",
+    "observed": "531 vs 431 tok/s at 32 x 768 (+23%); 286.0 vs 288.9 at 16 x 4,096 (tie)",
+    "label": "MEASURED",
+    "regime": {
+      "model_file": "Qwen3.5-9B Q4_0",
+      "runtime": "llama-server, custom WMMA build vs small-N build, Vulkan",
+      "slots_x_ctx": "32 x 768 and 16 x 4,096",
+      "kv_type": "f16 (32 x 768) and q8_0 (16 x 4,096)",
+      "call_shape": "thinking-off, n_predict = ctx - 128"
+    },
+    "gate": "output-agreement gate before any use",
+    "status": "RETIRED",
+    "status_reason": "Q4_0-only, gains only at 32 slots, agreement gate never run.",
+    "attempts": []
+  },
+  {
+    "id": "L1.5",
+    "problem": "Context per GB of VRAM",
+    "lever": "q8_0 KV cache + --load-mode none + --cache-ram 0 + --ctx-checkpoints 0",
+    "rationale": "Halve KV bytes; avoid host-side copies counted against memory.",
+    "predicted": "none recorded",
+    "observed": "1 x 32,768 loads; at 28,000 prompt tokens: prefill 763 tok/s, decode 36.6 tok/s, VRAM peak 6.07 GB",
+    "label": "MEASURED",
+    "regime": {
+      "model_file": "Qwen3.5-9B Q4_K_M (public imatrix)",
+      "runtime": "llama-server (fork build), Vulkan",
+      "slots_x_ctx": "1 x 32,768",
+      "kv_type": "q8_0 K and V, flash attention on",
+      "call_shape": "synthetic prompts 8k/20k/28k, 512 generated tokens"
+    },
+    "gate": "quality cost of q8_0 KV never measured on a task",
+    "status": "DEPLOYED",
+    "attempts": []
+  },
+  {
+    "id": "L3.3",
+    "problem": "Quantization loss of the deployed file",
+    "lever": "Q4_0-format files (to inherit the Q4_0 kernels)",
+    "rationale": "A Q4_0 file would let L1.3/L1.4 fire.",
+    "predicted": "mean KLD <= about 0.005",
+    "observed": "mean KLD vs BF16: Q4_0 + own imatrix 0.0270 (p99 0.302, same top-1 95.67%); mixed Q4_0/Q8_0 0.0072 (p99 0.077, 97.77%); deployed Q4_K_M 0.0042",
+    "label": "MEASURED",
+    "regime": {
+      "model_file": "candidate GGUFs of Qwen3.5-9B",
+      "runtime": "KL-divergence job run off the home machine (batch cluster); exact text set not re-checked here",
+      "slots_x_ctx": "n/a (offline KL)",
+      "kv_type": "reference run with f16 KV",
+      "call_shape": "fixed text, BF16 reference logits"
+    },
+    "gate": "mean KLD <= about 0.005",
+    "status": "RETIRED",
+    "status_reason": "Neither Q4_0-format candidate passed the screen.",
+    "attempts": []
+  }
+]

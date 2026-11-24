@@ -1,0 +1,36 @@
+Patch 2/4: finetune-lora: do not skip dataset position 0 on a fresh
+ epoch
+
+llama_opt_epoch_resume starts at resume_from_batch + 1. The example passed 0 on a fresh start, so item 0 was never trained (N-1 updates per epoch). Pass -1 on a fresh epoch and (start_step % N) - 1 on resume. The resume branch is untested.
+---
+ examples/training/finetune-lora.cpp | 11 +++++++----
+ 1 file changed, 7 insertions(+), 4 deletions(-)
+
+diff --git a/examples/training/finetune-lora.cpp b/examples/training/finetune-lora.cpp
+index 03b8b59..77ef0b5 100644
+--- a/examples/training/finetune-lora.cpp
++++ b/examples/training/finetune-lora.cpp
+@@ -963,16 +963,19 @@ int main(int argc, char ** argv) {
+         LOG_INF("Starting epoch %d (step %lld, lr=%.4e)\n", epoch, (long long)cb_data.global_step, cb_data.learning_rate);
+         cb_data.current_epoch = epoch;
+ 
+-        int64_t resume_batch = 0;
++        // patch 0002 (fresh-epoch skip fix): llama_opt_epoch_resume starts at resume_from_batch + 1, so a fresh epoch must
++        // pass -1 (0 skipped dataset position 0). On resume, start_step counts completed updates, so the last
++        // completed position of this epoch is (start_step % N) - 1. The resume branch is untested here.
++        int64_t resume_batch = -1;
+         if (start_step > 0 && epoch == start_epoch) {
+-            resume_batch = start_step % training_batches_per_epoch;
++            resume_batch = (start_step % training_batches_per_epoch) - 1;
+         }
+ 
+         ggml_opt_epoch_callback epoch_callback = (ft_params.checkpoint_save_steps <= 0) ?
+             ggml_opt_epoch_callback_progress_bar : checkpoint_progress_callback;
+ 
+-        if (resume_batch > 0) {
+-            LOG_INF("Resuming training from epoch %d, step %" PRId64 " \n", epoch, resume_batch);
++        if (resume_batch >= 0) {
++            LOG_INF("Resuming training from epoch %d, after dataset position %" PRId64 " \n", epoch, resume_batch);
+         } else if (ft_params.checkpoint_save_steps > 0) {
+             LOG_INF("Checkpointing enabled, saving every %d steps\n", ft_params.checkpoint_save_steps);
+         } else {

@@ -1,0 +1,74 @@
+Patch 1/4: llama-lora-training: LoRA targets for Gated DeltaNet
+ projections (attn_qkv, attn_gate, ssm_out)
+
+Adds target bits 12-14, CLI names attn_qkv, attn_gate, ssm_out and the group 'deltanet'. The qwen35 graph already routes these projections through build_lora_mm; only the trainer's targeting could not reach them.
+---
+ examples/training/finetune-lora.cpp | 11 +++++++++--
+ include/llama.h                     |  3 +++
+ src/llama-lora-training.cpp         |  3 +++
+ 3 files changed, 15 insertions(+), 2 deletions(-)
+
+diff --git a/examples/training/finetune-lora.cpp b/examples/training/finetune-lora.cpp
+index 394df7d..03b8b59 100644
+--- a/examples/training/finetune-lora.cpp
++++ b/examples/training/finetune-lora.cpp
+@@ -170,6 +170,10 @@ static uint32_t parse_lora_modules(const std::string& modules_str) {
+         {"ffn_up_exps",      LLAMA_LORA_TARGET_FFN_UP_EXPS},
+         {"ffn_down_exps",    LLAMA_LORA_TARGET_FFN_DOWN_EXPS},
+         {"ffn_gate_up_exps", LLAMA_LORA_TARGET_FFN_GATE_UP_EXPS},
++        {"attn_qkv",         LLAMA_LORA_TARGET_ATTN_QKV},
++        {"attn_gate",        LLAMA_LORA_TARGET_ATTN_GATE},
++        {"ssm_out",          LLAMA_LORA_TARGET_SSM_OUT},
++        {"deltanet",         LLAMA_LORA_TARGET_ATTN_QKV | LLAMA_LORA_TARGET_ATTN_GATE | LLAMA_LORA_TARGET_SSM_OUT},
+         {"moe_experts",      LLAMA_LORA_TARGET_FFN_GATE_EXPS |
+                              LLAMA_LORA_TARGET_FFN_UP_EXPS |
+                              LLAMA_LORA_TARGET_FFN_DOWN_EXPS |
+@@ -771,7 +775,7 @@ int main(int argc, char ** argv) {
+         }
+     } else {
+         LOG_INF("Target modules: Q=%s, K=%s, V=%s, O=%s, GATE=%s, UP=%s, DOWN=%s, OUTPUT=%s, "
+-                "GATE_EXPS=%s, UP_EXPS=%s, DOWN_EXPS=%s, GATE_UP_EXPS=%s\n",
++                "GATE_EXPS=%s, UP_EXPS=%s, DOWN_EXPS=%s, GATE_UP_EXPS=%s, ATTN_QKV=%s, ATTN_GATE=%s, SSM_OUT=%s\n",
+             (lora_params.target_modules & LLAMA_LORA_TARGET_ATTN_Q) ? "yes" : "no",
+             (lora_params.target_modules & LLAMA_LORA_TARGET_ATTN_K) ? "yes" : "no",
+             (lora_params.target_modules & LLAMA_LORA_TARGET_ATTN_V) ? "yes" : "no",
+@@ -783,7 +787,10 @@ int main(int argc, char ** argv) {
+             (lora_params.target_modules & LLAMA_LORA_TARGET_FFN_GATE_EXPS) ? "yes" : "no",
+             (lora_params.target_modules & LLAMA_LORA_TARGET_FFN_UP_EXPS) ? "yes" : "no",
+             (lora_params.target_modules & LLAMA_LORA_TARGET_FFN_DOWN_EXPS) ? "yes" : "no",
+-            (lora_params.target_modules & LLAMA_LORA_TARGET_FFN_GATE_UP_EXPS) ? "yes" : "no");
++            (lora_params.target_modules & LLAMA_LORA_TARGET_FFN_GATE_UP_EXPS) ? "yes" : "no",
++            (lora_params.target_modules & LLAMA_LORA_TARGET_ATTN_QKV) ? "yes" : "no",
++            (lora_params.target_modules & LLAMA_LORA_TARGET_ATTN_GATE) ? "yes" : "no",
++            (lora_params.target_modules & LLAMA_LORA_TARGET_SSM_OUT) ? "yes" : "no");
+ 
+         LOG_INF("LoRA configuration: rank=%d, alpha=%.1f (scaling=%.3f)\n",
+                 lora_params.rank, lora_params.alpha, lora_params.alpha / lora_params.rank);
+diff --git a/include/llama.h b/include/llama.h
+index 435cf0d..48f2d59 100644
+--- a/include/llama.h
++++ b/include/llama.h
+@@ -1827,6 +1827,9 @@ extern "C" {
+         LLAMA_LORA_TARGET_FFN_UP_EXPS       = 1 << 9,
+         LLAMA_LORA_TARGET_FFN_DOWN_EXPS     = 1 << 10,
+         LLAMA_LORA_TARGET_FFN_GATE_UP_EXPS  = 1 << 11,
++        LLAMA_LORA_TARGET_ATTN_QKV          = 1 << 12, // patch 0001: qwen35 Gated DeltaNet fused qkv
++        LLAMA_LORA_TARGET_ATTN_GATE         = 1 << 13, // patch 0001: qwen35 Gated DeltaNet output gate (z)
++        LLAMA_LORA_TARGET_SSM_OUT           = 1 << 14, // patch 0001: qwen35 Gated DeltaNet out projection
+         LLAMA_LORA_TARGET_ALL               = -1
+     };
+ 
+diff --git a/src/llama-lora-training.cpp b/src/llama-lora-training.cpp
+index 1019575..6adc80c 100644
+--- a/src/llama-lora-training.cpp
++++ b/src/llama-lora-training.cpp
+@@ -121,6 +121,9 @@ static bool lora_should_target(const std::string & tensor_name, uint32_t target_
+         if ((target_modules & LLAMA_LORA_TARGET_FFN_UP_EXPS)       && tensor_module_is(tensor_name, "ffn_up_exps"))      return true;
+         if ((target_modules & LLAMA_LORA_TARGET_FFN_DOWN_EXPS)     && tensor_module_is(tensor_name, "ffn_down_exps"))    return true;
+         if ((target_modules & LLAMA_LORA_TARGET_FFN_GATE_UP_EXPS)  && tensor_module_is(tensor_name, "ffn_gate_up_exps")) return true;
++        if ((target_modules & LLAMA_LORA_TARGET_ATTN_QKV)          && tensor_module_is(tensor_name, "attn_qkv"))         return true;
++        if ((target_modules & LLAMA_LORA_TARGET_ATTN_GATE)         && tensor_module_is(tensor_name, "attn_gate"))        return true;
++        if ((target_modules & LLAMA_LORA_TARGET_SSM_OUT)           && tensor_module_is(tensor_name, "ssm_out"))          return true;
+     }
+ 
+     if ((target_modules & LLAMA_LORA_TARGET_OUTPUT) && tensor_is_output(tensor_name)) return true;

@@ -1,0 +1,69 @@
+Patch 4/4: llama-lora-training: optional block-range filter
+ (LORA_BLOCKS=LO-HI)
+
+Restricts block adapters to blocks LO..HI (0-based, inclusive). Unset: no filter. Malformed: abort.
+---
+ src/llama-lora-training.cpp | 40 ++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 39 insertions(+), 1 deletion(-)
+
+diff --git a/src/llama-lora-training.cpp b/src/llama-lora-training.cpp
+index 6adc80c..4543b5f 100644
+--- a/src/llama-lora-training.cpp
++++ b/src/llama-lora-training.cpp
+@@ -1,6 +1,8 @@
+ #include "llama-lora-training.h"
+ 
+ #include <cstring>
++#include <cstdio>
++#include <cstdlib>
+ #include <map>
+ #include <random>
+ #include <filesystem>
+@@ -106,10 +108,46 @@ static bool tensor_is_output(const std::string & name) {
+     return name.compare(0, prefix.size(), prefix) == 0;
+ }
+ 
++// patch 0004: optional block-range filter. LORA_BLOCKS="LO-HI" (0-based, inclusive)
++// restricts block adapters to blocks LO..HI. Unset or empty: no filter. Malformed: abort (fail closed).
++static bool lora_block_in_range(const std::string & tensor_name) {
++    static int lo = -1, hi = -1, state = 0; // 0 = not read, 1 = no filter, 2 = filter active
++    if (state == 0) {
++        const char * s = std::getenv("LORA_BLOCKS");
++        if (!s || !*s) {
++            state = 1;
++        } else {
++            char * e1 = nullptr;
++            char * e2 = nullptr;
++            const long a = std::strtol(s, &e1, 10);
++            const bool dash = e1 && e1 != s && *e1 == '-';
++            const long b = dash ? std::strtol(e1 + 1, &e2, 10) : -1;
++            if (!dash || !e2 || e2 == e1 + 1 || *e2 != 0 || a < 0 || b < a || b > 4095) {
++                fprintf(stderr, "lora: LORA_BLOCKS='%s' is malformed (want LO-HI, 0-based, inclusive)\n", s);
++                std::abort();
++            }
++            lo = (int) a;
++            hi = (int) b;
++            state = 2;
++            fprintf(stderr, "lora: LORA_BLOCKS=%d-%d: block adapters only on blocks %d..%d\n", lo, hi, lo, hi);
++        }
++    }
++    if (state == 1) {
++        return true;
++    }
++    const char * p = tensor_name.c_str() + 4; // caller guarantees the "blk." prefix
++    char * e = nullptr;
++    const long n = std::strtol(p, &e, 10);
++    if (e == p || *e != '.') {
++        return false;
++    }
++    return n >= lo && n <= hi;
++}
++
+ static bool lora_should_target(const std::string & tensor_name, uint32_t target_modules) {
+     const bool is_blk = tensor_name.compare(0, 4, "blk.") == 0;
+ 
+-    if (is_blk) {
++    if (is_blk && lora_block_in_range(tensor_name)) {
+         if ((target_modules & LLAMA_LORA_TARGET_ATTN_Q)            && tensor_module_is(tensor_name, "attn_q"))           return true;
+         if ((target_modules & LLAMA_LORA_TARGET_ATTN_K)            && tensor_module_is(tensor_name, "attn_k"))           return true;
+         if ((target_modules & LLAMA_LORA_TARGET_ATTN_V)            && tensor_module_is(tensor_name, "attn_v"))           return true;

@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "consumer-gpu-llm"
+version = "0.1.0"
+description = "Measured notes, llama.cpp patches and small tools for running and LoRA-fine-tuning a 9B hybrid model on an 8 GB AMD GPU"
+readme = "README.md"
+license = { text = "Unlicense" }
+authors = [{ name = "Lukáš Staník", email = "lukista4@gmail.com" }]
+requires-python = ">=3.9"
+dependencies = []
+
+[project.optional-dependencies]
+test = ["pytest>=7"]
+
+[project.scripts]
+cgl-gguf-info = "consumer_gpu_llm.gguf:main"
+cgl-quant-sizes = "consumer_gpu_llm.quant_sizes:main"
+cgl-block-compare = "consumer_gpu_llm.block_compare:main"
+cgl-server-bench = "consumer_gpu_llm.server_bench:main"
+cgl-ledger = "consumer_gpu_llm.ledger:main"
+cgl-register = "consumer_gpu_llm.register:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
